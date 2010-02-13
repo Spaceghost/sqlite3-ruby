@@ -73,6 +73,19 @@ static VALUE threadsafe_p(VALUE UNUSED(klass))
   return INT2NUM(sqlite3_threadsafe());
 }
 
+/* call-seq: SQLite3.vfs_register(name, obj)
+ *
+ * Register a new Virtual Filesystem named +name+ attached to object +obj+
+ */
+static VALUE vfs_register(VALUE mod, VALUE obj)
+{
+  sqlite3_vfs * vfs;
+  Data_Get_Struct(obj, sqlite3_vfs, vfs);
+  sqlite3_vfs_register(vfs, 0);
+
+  return obj;
+}
+
 void Init_sqlite3_native()
 {
   /*
@@ -98,9 +111,12 @@ void Init_sqlite3_native()
 #ifdef HAVE_SQLITE3_BACKUP_INIT
   init_sqlite3_backup();
 #endif
+  init_sqlite3_vfs();
 
   rb_define_singleton_method(mSqlite3, "libversion", libversion, 0);
   rb_define_singleton_method(mSqlite3, "threadsafe", threadsafe_p, 0);
   rb_define_const(mSqlite3, "SQLITE_VERSION", rb_str_new2(SQLITE_VERSION));
   rb_define_const(mSqlite3, "SQLITE_VERSION_NUMBER", INT2FIX(SQLITE_VERSION_NUMBER));
+  rb_define_singleton_method(mSqlite3, "libversion", libversion, 0);
+  rb_define_singleton_method(mSqlite3, "vfs_register", vfs_register, 1);
 }
