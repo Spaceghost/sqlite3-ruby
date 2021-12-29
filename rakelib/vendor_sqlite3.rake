@@ -17,7 +17,7 @@ def define_sqlite_task(platform, host)
 
     unless File.exist?(checkpoint)
       cflags = "-O2 -DSQLITE_ENABLE_COLUMN_METADATA"
-      cflags << " -fPIC" if recipe.host.include?("x86_64")
+      cflags << " -fPIC" if recipe.host && recipe.host.include?("x86_64")
       recipe.configure_options << "CFLAGS='#{cflags}'"
       recipe.cook
       touch checkpoint
@@ -28,7 +28,27 @@ def define_sqlite_task(platform, host)
 end
 
 # native sqlite3 compilation
-define_sqlite_task RUBY_PLATFORM, RbConfig::CONFIG["host"]
+recipe = define_sqlite_task(RUBY_PLATFORM, RbConfig::CONFIG["host"])
+
+# force compilation of sqlite3 when working natively under MinGW
+if RUBY_PLATFORM =~ /mingw/
+  RUBY_EXTENSION.config_options << "--with-opt-dir=#{recipe.path}"
+
+  # also prepend DevKit into compilation phase
+  Rake::Task["compile"].prerequisites.unshift "devkit", "ports:sqlite3:#{RUBY_PLATFORM}"
+  Rake::Task["native"].prerequisites.unshift "devkit", "ports:sqlite3:#{RUBY_PLATFORM}"
+
+  namespace "compile" do
+    desc "Build using MSYS2 sqlite package"
+    task :msys2 do
+      RUBY_EXTENSION.config_options.pop
+      t = Rake::Task["compile"]
+      t.prerequisites.clear
+      t.prerequisites << "devkit" << "compile:#{RUBY_PLATFORM}"
+      t.invoke
+    end
+  end
+end
 
 # trick to test local compilation of sqlite3
 if ENV["USE_MINI_PORTILE"] == "true"
@@ -40,11 +60,6 @@ if ENV["USE_MINI_PORTILE"] == "true"
 
   # compile sqlite3 first
   Rake::Task["compile"].prerequisites.unshift "ports:sqlite3:#{RUBY_PLATFORM}"
-end
-
-# force compilation of sqlite3 when working natively under MinGW
-if RUBY_PLATFORM =~ /mingw/
-  Rake::Task['compile'].prerequisites.unshift "ports:sqlite3:#{RUBY_PLATFORM}"
 end
 
 # iterate over all cross-compilation platforms and define the proper
@@ -84,4 +99,10 @@ task :cross do
   ["CC", "CXX", "LDFLAGS", "CPPFLAGS", "RUBYOPT"].each do |var|
     ENV.delete(var)
   end
+end
+
+desc "Build windows binary gems per rake-compiler-dock."
+task "gem:windows" do
+  require "rake_compiler_dock"
+  RakeCompilerDock.sh "bundle && rake cross native gem MAKE='nice make -j`nproc`'"
 end

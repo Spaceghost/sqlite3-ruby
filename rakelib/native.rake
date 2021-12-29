@@ -5,9 +5,17 @@ require 'rake/extensioncompiler'
 # NOTE: version used by cross compilation of Windows native extension
 # It do not affect compilation under other operating systems
 # The version indicated is the minimum DLL suggested for correct functionality
-BINARY_VERSION = "3.7.17"
-URL_VERSION    = "3071700"
-URL_PATH       = "/2013"
+BINARY_VERSION = "3.8.11.1"
+URL_VERSION    = "3081101"
+URL_PATH       = "/2015"
+
+task :devkit do
+  begin
+    require "devkit"
+  rescue LoadError => e
+    abort "Failed to activate RubyInstaller's DevKit required for compilation."
+  end
+end
 
 # build sqlite3_native C extension
 RUBY_EXTENSION = Rake::ExtensionTask.new('sqlite3_native', HOE.spec) do |ext|
@@ -25,7 +33,6 @@ RUBY_EXTENSION = Rake::ExtensionTask.new('sqlite3_native', HOE.spec) do |ext|
     # define target for extension (supporting fat binaries)
     RUBY_VERSION =~ /(\d+\.\d+)/
     ext.lib_dir = "lib/sqlite3/#{$1}"
-    ext.config_options << "--enable-local"
   else
 
     # detect cross-compiler available
@@ -33,6 +40,10 @@ RUBY_EXTENSION = Rake::ExtensionTask.new('sqlite3_native', HOE.spec) do |ext|
       Rake::ExtensionCompiler.mingw_host
       ext.cross_compile = true
       ext.cross_platform = ['i386-mswin32-60', 'i386-mingw32', 'x64-mingw32']
+      ext.cross_compiling do |spec|
+        # The fat binary gem doesn't depend on the sqlite3 package, since it bundles the library.
+        spec.metadata.delete('msys2_mingw_dependencies')
+      end
     rescue RuntimeError
       # noop
     end
@@ -40,6 +51,9 @@ RUBY_EXTENSION = Rake::ExtensionTask.new('sqlite3_native', HOE.spec) do |ext|
 end
 
 # ensure things are compiled prior testing
-task :test => [:compile]
-
+if RUBY_PLATFORM =~ /mingw/ then
+  task :test => ["compile:msys2"]
+else
+  task :test => [:compile]
+end
 # vim: syntax=ruby

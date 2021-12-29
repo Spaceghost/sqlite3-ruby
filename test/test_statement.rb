@@ -30,7 +30,11 @@ module SQLite3
       stmt.execute('ruby')
 
       exception = assert_raises(SQLite3::ConstraintException) { stmt.execute('ruby') }
-      assert_match /column(s)? .* (is|are) not unique/, exception.message
+      # SQLite 3.8.2 returns new error message:
+      #   UNIQUE constraint failed: *table_name*.*column_name*
+      # Older versions of SQLite return:
+      #   column *column_name* is not unique
+      assert_match(/(column(s)? .* (is|are) not unique|UNIQUE constraint failed: .*)/, exception.message)
     end
 
     ###
@@ -115,7 +119,15 @@ module SQLite3
       assert_equal [nil], result
     end
 
-    def test_bind_blobs
+    def test_bind_blob
+      @db.execute('create table foo(text BLOB)')
+      stmt = SQLite3::Statement.new(@db, 'insert into foo(text) values (?)')
+      stmt.bind_param(1, SQLite3::Blob.new('hello'))
+      stmt.execute
+      row = @db.execute('select * from foo')
+
+      assert_equal ['hello'], row.first
+      assert_equal row.first.types, ['BLOB']
     end
 
     def test_bind_64
@@ -186,11 +198,6 @@ module SQLite3
       assert_equal ['foo'], r
     end
 
-    def test_tainted
-      r = @stmt.step
-      assert r.first.tainted?
-    end
-
     def test_step_twice
       assert_not_nil @stmt.step
       assert !@stmt.done?
@@ -212,7 +219,7 @@ module SQLite3
 
     def test_column_name
       assert_equal "'foo'", @stmt.column_name(0)
-      assert_equal nil, @stmt.column_name(10)
+      assert_nil @stmt.column_name(10)
     end
 
     def test_bind_parameter_count
@@ -239,7 +246,7 @@ module SQLite3
       assert stmt.execute('employee-2')
     end
 
-    def test_clear_bindings
+    def test_clear_bindings!
       stmt = @db.prepare('select ?, ?')
       stmt.bind_param 1, "foo"
       stmt.bind_param 2, "bar"

@@ -54,12 +54,69 @@ module SQLite3
     # as hashes or not. By default, rows are returned as arrays.
     attr_accessor :results_as_hash
 
+    # call-seq: SQLite3::Database.new(file, options = {})
+    #
+    # Create a new Database object that opens the given file. If utf16
+    # is +true+, the filename is interpreted as a UTF-16 encoded string.
+    #
+    # By default, the new database will return result rows as arrays
+    # (#results_as_hash) and has type translation disabled (#type_translation=).
+
+    def initialize file, options = {}, zvfs = nil
+      mode = Constants::Open::READWRITE | Constants::Open::CREATE
+
+      file = file.to_path if file.respond_to? :to_path
+      if file.encoding == ::Encoding::UTF_16LE || file.encoding == ::Encoding::UTF_16BE || options[:utf16]
+        open16 file
+      else
+        # The three primary flag values for sqlite3_open_v2 are:
+        # SQLITE_OPEN_READONLY
+        # SQLITE_OPEN_READWRITE
+        # SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE -- always used for sqlite3_open and sqlite3_open16
+        mode = Constants::Open::READONLY if options[:readonly]
+
+        if options[:readwrite]
+          raise "conflicting options: readonly and readwrite" if options[:readonly]
+          mode = Constants::Open::READWRITE
+        end
+
+        if options[:flags]
+          if options[:readonly] || options[:readwrite]
+            raise "conflicting options: flags with readonly and/or readwrite"
+          end
+          mode = options[:flags]
+        end
+
+        open_v2 file.encode("utf-8"), mode, zvfs
+      end
+
+      @tracefunc        = nil
+      @authorizer       = nil
+      @encoding         = nil
+      @busy_handler     = nil
+      @collations       = {}
+      @functions        = {}
+      @results_as_hash  = options[:results_as_hash]
+      @type_translation = options[:type_translation]
+      @type_translator  = make_type_translator @type_translation
+      @readonly         = mode & Constants::Open::READONLY != 0
+
+      if block_given?
+        begin
+          yield self
+        ensure
+          close
+        end
+      end
+    end
+
     def type_translation= value # :nodoc:
       warn(<<-eowarn) if $VERBOSE
 #{caller[0]} is calling SQLite3::Database#type_translation=
 SQLite3::Database#type_translation= is deprecated and will be removed
 in version 2.0.0.
       eowarn
+      @type_translator  = make_type_translator value
       @type_translation = value
     end
     attr_reader :type_translation # :nodoc:
@@ -98,6 +155,13 @@ in version 2.0.0.
       end
     end
 
+    # Returns the filename for the database named +db_name+.  +db_name+ defaults
+    # to "main".  Main return `nil` or an empty string if the database is
+    # temporary or in-memory.
+    def filename db_name = 'main'
+      db_filename db_name
+    end
+
     # Executes the given SQL statement. If additional parameters are given,
     # they are treated as bind variables, and are bound to the placeholders in
     # the query.
@@ -113,10 +177,6 @@ in version 2.0.0.
     # See also #execute2, #query, and #execute_batch for additional ways of
     # executing statements.
     def execute sql, bind_vars = [], *args, &block
-      # FIXME: This is a terrible hack and should be removed but is required
-      # for older versions of rails
-      hack = Object.const_defined?(:ActiveRecord) && sql =~ /^PRAGMA index_list/
-
       if bind_vars.nil? || !args.empty?
         if args.empty?
           bind_vars = []
@@ -133,30 +193,14 @@ Support for bind parameters as *args will be removed in 2.0.0.
 
       prepare( sql ) do |stmt|
         stmt.bind_params(bind_vars)
-        columns = stmt.columns
-        stmt    = ResultSet.new(self, stmt).to_a if type_translation
+        stmt    = ResultSet.new self, stmt
 
         if block_given?
           stmt.each do |row|
-            if @results_as_hash
-              yield type_translation ? row : ordered_map_for(columns, row)
-            else
-              yield row
-            end
+            yield row
           end
         else
-          if @results_as_hash
-            stmt.map { |row|
-              h = type_translation ? row : ordered_map_for(columns, row)
-
-              # FIXME UGH TERRIBLE HACK!
-              h['unique'] = h['unique'].to_s if hack
-
-              h
-            }
-          else
-            stmt.to_a
-          end
+          stmt.to_a
         end
       end
     end
@@ -192,6 +236,9 @@ Support for bind parameters as *args will be removed in 2.0.0.
     #
     # This always returns +nil+, making it unsuitable for queries that return
     # rows.
+    #
+    # See also #execute_batch2 for additional ways of
+    # executing statements.
     def execute_batch( sql, bind_vars = [], *args )
       # FIXME: remove this stuff later
       unless [Array, Hash].include?(bind_vars.class)
@@ -236,8 +283,32 @@ Support for this behavior will be removed in version 2.0.0.
       nil
     end
 
+    # Executes all SQL statements in the given string. By contrast, the other
+    # means of executing queries will only execute the first statement in the
+    # string, ignoring all subsequent statements. This will execute each one
+    # in turn. Bind parameters cannot be passed to #execute_batch2.
+    #
+    # If a query is made, all values will be returned as strings.
+    # If no query is made, an empty array will be returned.
+    #
+    # Because all values except for 'NULL' are returned as strings,
+    # a block can be passed to parse the values accordingly.
+    #
+    # See also #execute_batch for additional ways of
+    # executing statements.
+    def execute_batch2(sql, &block)
+      if block_given?
+        result = exec_batch(sql, @results_as_hash)
+        result.map do |val|
+          yield val
+        end
+      else
+        exec_batch(sql, @results_as_hash)
+      end
+    end
+
     # This is a convenience method for creating a statement, binding
-    # paramters to it, and calling execute:
+    # parameters to it, and calling execute:
     #
     #   result = db.query( "select * from foo where a=?", [5])
     #   # is the same as
@@ -289,7 +360,11 @@ Support for this will be removed in version 2.0.0.
     #
     # See also #get_first_row.
     def get_first_value( sql, *bind_vars )
-      execute( sql, *bind_vars ) { |row| return row[0] }
+      query( sql, bind_vars ) do |rs|
+        if (row = rs.next)
+          return @results_as_hash ? row[rs.columns[0]] : row[0]
+        end
+      end
       nil
     end
 
@@ -318,8 +393,8 @@ Support for this will be removed in version 2.0.0.
     #   end
     #
     #   puts db.get_first_value( "select maim(name) from table" )
-    def create_function name, arity, text_rep=Constants::TextRep::ANY, &block
-      define_function(name) do |*args|
+    def create_function name, arity, text_rep=Constants::TextRep::UTF8, &block
+      define_function_with_flags(name, text_rep) do |*args|
         fp = FunctionProxy.new
         block.call(fp, *args)
         fp.result
@@ -366,39 +441,52 @@ Support for this will be removed in version 2.0.0.
     def create_aggregate( name, arity, step=nil, finalize=nil,
       text_rep=Constants::TextRep::ANY, &block )
 
-      factory = Class.new do
+      proxy = Class.new do
         def self.step( &block )
-          define_method(:step, &block)
+          define_method(:step_with_ctx, &block)
         end
 
         def self.finalize( &block )
-          define_method(:finalize, &block)
+          define_method(:finalize_with_ctx, &block)
         end
       end
 
       if block_given?
-        factory.instance_eval(&block)
+        proxy.instance_eval(&block)
       else
-        factory.class_eval do
-          define_method(:step, step)
-          define_method(:finalize, finalize)
+        proxy.class_eval do
+          define_method(:step_with_ctx, step)
+          define_method(:finalize_with_ctx, finalize)
         end
       end
 
-      proxy = factory.new
-      proxy.extend(Module.new {
-        attr_accessor :ctx
+      proxy.class_eval do
+        # class instance variables
+        @name = name
+        @arity = arity
+
+        def self.name
+          @name
+        end
+
+        def self.arity
+          @arity
+        end
+
+        def initialize
+          @ctx = FunctionProxy.new
+        end
 
         def step( *args )
-          super(@ctx, *args)
+          step_with_ctx(@ctx, *args)
         end
 
         def finalize
-          super(@ctx)
+          finalize_with_ctx(@ctx)
+          @ctx.result
         end
-      })
-      proxy.ctx = FunctionProxy.new
-      define_aggregator(name, proxy)
+      end
+      define_aggregator2(proxy, name)
     end
 
     # This is another approach to creating an aggregate function (see
@@ -431,6 +519,7 @@ Support for this will be removed in version 2.0.0.
     #
     #   class LengthsAggregateHandler
     #     def self.arity; 1; end
+    #     def self.name; 'lengths'; end
     #
     #     def initialize
     #       @total = 0
@@ -448,29 +537,75 @@ Support for this will be removed in version 2.0.0.
     #   db.create_aggregate_handler( LengthsAggregateHandler )
     #   puts db.get_first_value( "select lengths(name) from A" )
     def create_aggregate_handler( handler )
-      proxy = Class.new do
-        def initialize klass
-          @klass = klass
-          @fp    = FunctionProxy.new
+      # This is a compatibility shim so the (basically pointless) FunctionProxy
+      # "ctx" object is passed as first argument to both step() and finalize().
+      # Now its up to the library user whether he prefers to store his
+      # temporaries as instance variables or fields in the FunctionProxy.
+      # The library user still must set the result value with
+      # FunctionProxy.result= as there is no backwards compatible way to
+      # change this.
+      proxy = Class.new(handler) do
+        def initialize
+          super
+          @fp = FunctionProxy.new
         end
 
         def step( *args )
-          instance.step(@fp, *args)
+          super(@fp, *args)
         end
 
         def finalize
-          instance.finalize @fp
-          @instance = nil
+          super(@fp)
           @fp.result
         end
+      end
+      define_aggregator2(proxy, proxy.name)
+      self
+    end
 
-        private
+    # Define an aggregate function named +name+ using a object template
+    # object +aggregator+. +aggregator+ must respond to +step+ and +finalize+.
+    # +step+ will be called with row information and +finalize+ must return the
+    # return value for the aggregator function.
+    #
+    # _API Change:_ +aggregator+ must also implement +clone+. The provided
+    # +aggregator+ object will serve as template that is cloned to provide the
+    # individual instances of the aggregate function. Regular ruby objects
+    # already provide a suitable +clone+.
+    # The functions arity is the arity of the +step+ method.
+    def define_aggregator( name, aggregator )
+      # Previously, this has been implemented in C. Now this is just yet
+      # another compatibility shim
+      proxy = Class.new do
+        @template = aggregator
+        @name = name
 
-        def instance
-          @instance ||= @klass.new
+        def self.template
+          @template
+        end
+
+        def self.name
+          @name
+        end
+
+        def self.arity
+          # this is what sqlite3_obj_method_arity did before
+          @template.method(:step).arity
+        end
+
+        def initialize
+          @klass = self.class.template.clone
+        end
+
+        def step(*args)
+          @klass.step(*args)
+        end
+
+        def finalize
+          @klass.finalize
         end
       end
-      define_aggregator(handler.name, proxy.new(handler))
+      define_aggregator2(proxy, name)
       self
     end
 
@@ -497,7 +632,7 @@ Support for this will be removed in version 2.0.0.
         abort = false
         begin
           yield self
-        rescue ::Object
+        rescue
           abort = true
           raise
         ensure
@@ -578,12 +713,25 @@ Support for this will be removed in version 2.0.0.
       end
     end
 
+    # Translates a +row+ of data from the database with the given +types+
+    def translate_from_db types, row
+      @type_translator.call types, row
+    end
+
     private
 
-    def ordered_map_for columns, row
-      h = Hash[*columns.zip(row).flatten]
-      row.each_with_index { |r, i| h[i] = r }
-      h
+    NULL_TRANSLATOR = lambda { |_, row| row }
+
+    def make_type_translator should_translate
+      if should_translate
+        lambda { |types, row|
+          types.zip(row).map do |type, value|
+            translator.translate( type, value )
+          end
+        }
+      else
+        NULL_TRANSLATOR
+      end
     end
   end
 end

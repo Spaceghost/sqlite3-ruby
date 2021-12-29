@@ -43,11 +43,9 @@ static VALUE initialize(VALUE self, VALUE db, VALUE sql)
   if(!db_ctx->db)
     rb_raise(rb_eArgError, "prepare called on a closed database");
 
-#ifdef HAVE_RUBY_ENCODING_H
   if(!UTF8_P(sql)) {
     sql               = rb_str_export_to_enc(sql, rb_utf8_encoding());
   }
-#endif
 
 #ifdef HAVE_SQLITE3_PREPARE_V2
   status = sqlite3_prepare_v2(
@@ -110,10 +108,7 @@ static VALUE step(VALUE self)
   sqlite3_stmt *stmt;
   int value, length;
   VALUE list;
-#ifdef HAVE_RUBY_ENCODING_H
   rb_encoding * internal_encoding;
-  int enc_index;
-#endif
 
   Data_Get_Struct(self, sqlite3StmtRuby, ctx);
 
@@ -121,18 +116,24 @@ static VALUE step(VALUE self)
 
   if(ctx->done_p) return Qnil;
 
-#ifdef HAVE_RUBY_ENCODING_H
   {
       VALUE db          = rb_iv_get(self, "@connection");
-      VALUE encoding    = rb_funcall(db, rb_intern("encoding"), 0);
-      enc_index = NIL_P(encoding) ? rb_utf8_encindex() : rb_to_encoding_index(encoding);
+      rb_funcall(db, rb_intern("encoding"), 0);
       internal_encoding = rb_default_internal_encoding();
   }
-#endif
 
   stmt = ctx->st;
 
   value = sqlite3_step(stmt);
+  if (rb_errinfo() != Qnil) {
+    /* some user defined function was invoked as a callback during step and
+     * it raised an exception that has been suppressed until step returns.
+     * Now re-raise it. */
+    VALUE exception = rb_errinfo();
+    rb_set_errinfo(Qnil);
+    rb_exc_raise(exception);
+  }
+
   length = sqlite3_column_count(stmt);
   list = rb_ary_new2((long)length);
 
@@ -150,21 +151,19 @@ static VALUE step(VALUE self)
               break;
             case SQLITE_TEXT:
               {
-                VALUE str = rb_tainted_str_new(
+                VALUE str = rb_str_new(
                     (const char *)sqlite3_column_text(stmt, i),
                     (long)sqlite3_column_bytes(stmt, i)
                 );
-#ifdef HAVE_RUBY_ENCODING_H
                 rb_enc_associate_index(str, rb_utf8_encindex());
                 if(internal_encoding)
                   str = rb_str_export_to_enc(str, internal_encoding);
-#endif
                 rb_ary_push(list, str);
               }
               break;
             case SQLITE_BLOB:
               {
-                VALUE str = rb_tainted_str_new(
+                VALUE str = rb_str_new(
                     (const char *)sqlite3_column_blob(stmt, i),
                     (long)sqlite3_column_bytes(stmt, i)
                 );
@@ -227,9 +226,7 @@ static VALUE bind_param(VALUE self, VALUE key, VALUE value)
   switch(TYPE(value)) {
     case T_STRING:
       if(CLASS_OF(value) == cSqlite3Blob
-#ifdef HAVE_RUBY_ENCODING_H
               || rb_enc_get_index(value) == rb_ascii8bit_encindex()
-#endif
         ) {
         status = sqlite3_bind_blob(
             ctx->st,
@@ -241,8 +238,7 @@ static VALUE bind_param(VALUE self, VALUE key, VALUE value)
       } else {
 
 
-#ifdef HAVE_RUBY_ENCODING_H
-        if (UTF16_LE_P(value)) {
+        if (UTF16_LE_P(value) || UTF16_BE_P(value)) {
           status = sqlite3_bind_text16(
               ctx->st,
               index,
@@ -254,7 +250,6 @@ static VALUE bind_param(VALUE self, VALUE key, VALUE value)
           if (!UTF8_P(value) || !USASCII_P(value)) {
               value = rb_str_encode(value, rb_enc_from_encoding(rb_utf8_encoding()), 0, Qnil);
           }
-#endif
         status = sqlite3_bind_text(
             ctx->st,
             index,
@@ -262,16 +257,16 @@ static VALUE bind_param(VALUE self, VALUE key, VALUE value)
             (int)RSTRING_LEN(value),
             SQLITE_TRANSIENT
             );
-#ifdef HAVE_RUBY_ENCODING_H
         }
-#endif
       }
       break;
-    case T_BIGNUM:
-      if (RBIGNUM_LEN(value) * SIZEOF_BDIGITS <= 8) {
-          status = sqlite3_bind_int64(ctx->st, index, (sqlite3_int64)NUM2LL(value));
+    case T_BIGNUM: {
+      sqlite3_int64 num64;
+      if (bignum_to_int64(value, &num64)) {
+          status = sqlite3_bind_int64(ctx->st, index, num64);
           break;
       }
+    }
     case T_FLOAT:
       status = sqlite3_bind_double(ctx->st, index, NUM2DBL(value));
       break;
@@ -295,17 +290,16 @@ static VALUE bind_param(VALUE self, VALUE key, VALUE value)
 /* call-seq: stmt.reset!
  *
  * Resets the statement. This is typically done internally, though it might
- * occassionally be necessary to manually reset the statement.
+ * occasionally be necessary to manually reset the statement.
  */
 static VALUE reset_bang(VALUE self)
 {
   sqlite3StmtRubyPtr ctx;
-  int status;
 
   Data_Get_Struct(self, sqlite3StmtRuby, ctx);
   REQUIRE_OPEN_STMT(ctx);
 
-  status = sqlite3_reset(ctx->st);
+  sqlite3_reset(ctx->st);
 
   ctx->done_p = 0;
 
@@ -315,17 +309,16 @@ static VALUE reset_bang(VALUE self)
 /* call-seq: stmt.clear_bindings!
  *
  * Resets the statement. This is typically done internally, though it might
- * occassionally be necessary to manually reset the statement.
+ * occasionally be necessary to manually reset the statement.
  */
-static VALUE clear_bindings(VALUE self)
+static VALUE clear_bindings_bang(VALUE self)
 {
   sqlite3StmtRubyPtr ctx;
-  int status;
 
   Data_Get_Struct(self, sqlite3StmtRuby, ctx);
   REQUIRE_OPEN_STMT(ctx);
 
-  status = sqlite3_clear_bindings(ctx->st);
+  sqlite3_clear_bindings(ctx->st);
 
   ctx->done_p = 0;
 
@@ -435,7 +428,7 @@ void init_sqlite3_statement()
   rb_define_method(cSqlite3Statement, "closed?", closed_p, 0);
   rb_define_method(cSqlite3Statement, "bind_param", bind_param, 2);
   rb_define_method(cSqlite3Statement, "reset!", reset_bang, 0);
-  rb_define_method(cSqlite3Statement, "clear_bindings!", clear_bindings, 0);
+  rb_define_method(cSqlite3Statement, "clear_bindings!", clear_bindings_bang, 0);
   rb_define_method(cSqlite3Statement, "step", step, 0);
   rb_define_method(cSqlite3Statement, "done?", done_p, 0);
   rb_define_method(cSqlite3Statement, "column_count", column_count, 0);

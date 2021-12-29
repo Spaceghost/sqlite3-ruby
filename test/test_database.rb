@@ -1,4 +1,6 @@
 require 'helper'
+require 'tempfile'
+require 'pathname'
 
 module SQLite3
   class TestDatabase < SQLite3::TestCase
@@ -6,10 +8,70 @@ module SQLite3
 
     def setup
       @db = SQLite3::Database.new(':memory:')
+      super
     end
 
     def test_segv
-      assert_raises(TypeError) { SQLite3::Database.new 1 }
+      assert_raises { SQLite3::Database.new 1 }
+    end
+
+    def test_db_filename
+      tf = nil
+      assert_equal '', @db.filename('main')
+      tf = Tempfile.new 'thing'
+      @db = SQLite3::Database.new tf.path
+      assert_equal File.expand_path(tf.path), File.expand_path(@db.filename('main'))
+    ensure
+      tf.unlink if tf
+    end
+
+    def test_filename
+      tf = nil
+      assert_equal '', @db.filename
+      tf = Tempfile.new 'thing'
+      @db = SQLite3::Database.new tf.path
+      assert_equal File.expand_path(tf.path), File.expand_path(@db.filename)
+    ensure
+      tf.unlink if tf
+    end
+
+    def test_filename_with_attachment
+      tf = nil
+      assert_equal '', @db.filename
+      tf = Tempfile.new 'thing'
+      @db.execute "ATTACH DATABASE '#{tf.path}' AS 'testing'"
+      assert_equal File.expand_path(tf.path), File.expand_path(@db.filename('testing'))
+    ensure
+      tf.unlink if tf
+    end
+
+
+    def test_filename_to_path
+      tf = Tempfile.new 'thing'
+      pn = Pathname tf.path
+      db = SQLite3::Database.new pn
+      assert_equal pn.expand_path.to_s, File.expand_path(db.filename)
+    ensure
+      tf.close! if tf
+    end
+
+
+    def test_error_code
+      begin
+        db.execute 'SELECT'
+      rescue SQLite3::SQLException => e
+      end
+      assert_equal 1, e.code
+    end
+
+    def test_extended_error_code
+      db.extended_result_codes = true
+      db.execute 'CREATE TABLE "employees" ("token" integer NOT NULL)'
+      begin
+        db.execute 'INSERT INTO employees (token) VALUES (NULL)'
+      rescue SQLite3::ConstraintException => e
+      end
+      assert_equal 1299, e.code
     end
 
     def test_bignum
@@ -33,15 +95,17 @@ module SQLite3
 
     def test_get_first_row_with_type_translation_and_hash_results
       @db.results_as_hash = true
-      assert_equal({0=>1, "1"=>1}, @db.get_first_row('SELECT 1'))
+      @db.type_translation = true
+      assert_equal({"1"=>1}, @db.get_first_row('SELECT 1'))
     end
 
     def test_execute_with_type_translation_and_hash
       @db.results_as_hash = true
+      @db.type_translation = true
       rows = []
       @db.execute('SELECT 1') { |row| rows << row }
 
-      assert_equal({0=>1, "1"=>1}, rows.first)
+      assert_equal({"1"=>1}, rows.first)
     end
 
     def test_encoding
@@ -66,6 +130,59 @@ module SQLite3
         CREATE TABLE items (id integer PRIMARY KEY AUTOINCREMENT);
         -- omg
       eosql
+    end
+
+    def test_execute_batch2
+      @db.results_as_hash = true
+      return_value = @db.execute_batch2 <<-eosql
+        CREATE TABLE items (id integer PRIMARY KEY AUTOINCREMENT, name string);
+        INSERT INTO items (name) VALUES ("foo");
+        INSERT INTO items (name) VALUES ("bar");
+        SELECT * FROM items;
+        eosql
+      assert_equal return_value, [{"id"=>"1","name"=>"foo"}, {"id"=>"2", "name"=>"bar"}]
+
+      return_value = @db.execute_batch2('SELECT * FROM items;') do |result|
+        result["id"] = result["id"].to_i
+        result
+      end
+      assert_equal return_value, [{"id"=>1,"name"=>"foo"}, {"id"=>2, "name"=>"bar"}]
+
+      return_value = @db.execute_batch2('INSERT INTO items (name) VALUES ("oof")')
+      assert_equal return_value, []
+
+      return_value = @db.execute_batch2(
+       'CREATE TABLE employees (id integer PRIMARY KEY AUTOINCREMENT, name string, age integer(3));
+        INSERT INTO employees (age) VALUES (30);
+        INSERT INTO employees (age) VALUES (40);
+        INSERT INTO employees (age) VALUES (20);
+        SELECT age FROM employees;') do |result|
+          result["age"] = result["age"].to_i
+          result
+        end
+      assert_equal return_value, [{"age"=>30}, {"age"=>40}, {"age"=>20}]
+
+      return_value = @db.execute_batch2('SELECT name FROM employees');
+      assert_equal return_value, [{"name"=>nil}, {"name"=>nil}, {"name"=>nil}]
+
+      @db.results_as_hash = false
+      return_value = @db.execute_batch2(
+        'CREATE TABLE managers (id integer PRIMARY KEY AUTOINCREMENT, age integer(3));
+        INSERT INTO managers (age) VALUES (50);
+        INSERT INTO managers (age) VALUES (60);
+        SELECT id, age from managers;') do |result|
+          result = result.map do |res|
+            res.to_i
+          end
+          result
+        end
+      assert_equal return_value, [[1, 50], [2, 60]]
+
+      assert_raises (RuntimeError) do
+        # "names" is not a valid column
+        @db.execute_batch2 'INSERT INTO items (names) VALUES ("bazz")'
+      end
+
     end
 
     def test_new
@@ -109,6 +226,18 @@ module SQLite3
       assert thing.closed?
     end
 
+    def test_block_closes_self_even_raised
+      thing = nil
+      begin
+        SQLite3::Database.new(':memory:') do |db|
+          thing = db
+          raise
+        end
+      rescue
+      end
+      assert thing.closed?
+    end
+
     def test_prepare
       db = SQLite3::Database.new(':memory:')
       stmt = db.prepare('select "hello world"')
@@ -136,7 +265,7 @@ module SQLite3
       db.execute("create table foo ( a integer primary key, b text )")
       db.execute("insert into foo (b) values ('hello')")
       rows = db.execute("select * from foo")
-      assert_equal [{0=>1, "a"=>1, "b"=>"hello", 1=>"hello"}], rows
+      assert_equal [{"a"=>1, "b"=>"hello"}], rows
     end
 
     def test_execute_yields_hash
@@ -144,7 +273,7 @@ module SQLite3
       db.execute("create table foo ( a integer primary key, b text )")
       db.execute("insert into foo (b) values ('hello')")
       db.execute("select * from foo") do |row|
-        assert_equal({0=>1, "a"=>1, "b"=>"hello", 1=>"hello"}, row)
+        assert_equal({"a"=>1, "b"=>"hello"}, row)
       end
     end
 
@@ -261,9 +390,27 @@ module SQLite3
     end
 
     def test_function_return_types
-      [10, 2.2, nil, "foo"].each do |thing|
+      [10, 2.2, nil, "foo", Blob.new("foo\0bar")].each do |thing|
         @db.define_function("hello") { |a| thing }
         assert_equal [thing], @db.execute("select hello('world')").first
+      end
+    end
+
+    def test_function_gc_segfault
+      @db.create_function("bug", -1) { |func, *values| func.result = values.join }
+      # With a lot of data and a lot of threads, try to induce a GC segfault.
+      params = Array.new(127, "?" * 28000)
+      proc = Proc.new {
+        db.execute("select bug(#{Array.new(params.length, "?").join(",")})", params)
+      }
+      m = Mutex.new
+      30.times.map { Thread.new { m.synchronize { proc.call } } }.each(&:join)
+    end
+
+    def test_function_return_type_round_trip
+      [10, 2.2, nil, "foo", Blob.new("foo\0bar")].each do |thing|
+        @db.define_function("hello") { |a| a }
+        assert_equal [thing], @db.execute("select hello(hello(?))", [thing]).first
       end
     end
 
@@ -321,7 +468,7 @@ module SQLite3
         def call action, a, b, c, d; nil end
       }.new
       stmt = @db.prepare("select 'fooooo'")
-      assert_equal nil, stmt.step
+      assert_nil stmt.step
     end
 
     def test_authorizer_fail
