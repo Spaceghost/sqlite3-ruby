@@ -127,6 +127,19 @@ void init_sqlite3_constants()
 #endif
 }
 
+/* call-seq: SQLite3.vfs_register(name, obj)
+ *
+ * Register a new Virtual Filesystem attached to object +obj+
+ */
+static VALUE vfs_register(VALUE mod, VALUE obj)
+{
+  sqlite3_vfs * vfs;
+  Data_Get_Struct(obj, sqlite3_vfs, vfs);
+  sqlite3_vfs_register(vfs, 0);
+
+  return obj;
+ }
+
 void Init_sqlite3_native()
 {
   /*
@@ -150,11 +163,15 @@ void Init_sqlite3_native()
   init_sqlite3_constants();
   init_sqlite3_database();
   init_sqlite3_statement();
+#ifdef HAVE_SQLITE3_VFS_INIT
+  init_sqlite3_vfs();
+#endif
 #ifdef HAVE_SQLITE3_BACKUP_INIT
   init_sqlite3_backup();
 #endif
   rb_define_singleton_method(mSqlite3, "sqlcipher?", using_sqlcipher, 0);
   rb_define_singleton_method(mSqlite3, "libversion", libversion, 0);
+  rb_define_singleton_method(mSqlite3, "vfs_register", vfs_register, 1);
   rb_define_singleton_method(mSqlite3, "threadsafe", threadsafe_p, 0);
   rb_define_const(mSqlite3, "SQLITE_VERSION", rb_str_new2(SQLITE_VERSION));
   rb_define_const(mSqlite3, "SQLITE_VERSION_NUMBER", INT2FIX(SQLITE_VERSION_NUMBER));

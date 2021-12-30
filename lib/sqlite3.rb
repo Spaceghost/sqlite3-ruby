@@ -7,6 +7,8 @@ rescue LoadError
 end
 
 require 'sqlite3/database'
+require 'sqlite3/vfs'
+require 'sqlite3/vfs/file'
 require 'sqlite3/version'
 
 module SQLite3
