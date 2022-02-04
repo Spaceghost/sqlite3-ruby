@@ -126,7 +126,11 @@ static int rbFile_check_reserved_lock(sqlite3_file * ctx, int *pResOut)
 
 static int rbFile_file_control(sqlite3_file * ctx, int op, void *pArg)
 {
-  rb_raise(rb_eRuntimeError, "file control is unsupported");
+  rubyFilePtr rfile = (rubyFilePtr)ctx;
+  VALUE file = rfile->file;
+  VALUE fc = rb_funcall(file, rb_intern("file_control"), 1);
+
+  return (int)NUM2INT(fc);
 }
 
 static int rbFile_sector_size(sqlite3_file * ctx)

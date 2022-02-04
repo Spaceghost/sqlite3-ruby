@@ -56,7 +56,6 @@ static VALUE initialize(int argc, VALUE *argv, VALUE self)
   rb_scan_args(argc, argv, "12", &file, &opts, &zvfs);
 #if defined StringValueCStr
   StringValuePtr(file);
-  rb_check_safe_str(file);
 #else
   Check_SafeStr(file);
 #endif
